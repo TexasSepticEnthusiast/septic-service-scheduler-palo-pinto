@@ -1,271 +1,251 @@
+"""Calendar reminders from explicit service dates and chosen month intervals.
+
+AI-assisted contribution for Jake's Out West Septic project.
+See the repository documentation for source and scope limitations.
 """
-Out West Septic — outwestseptic.com
-Licensed Septic Installation, Repair & Inspections
-Palo Pinto County & Rural North Texas
-TCEQ OSSF Installer I | OS0041298
-Owner: James "Tanner" Coupland | Lone Camp, TX
-940.452.0598
-
-Septic tank pump-interval scheduler and .ics calendar export.
-
-Out West Septic does NOT run a pump truck. We refer pumping to a local
-pumper and use this scheduler to give homeowners a defensible
-"pump every N years" estimate based on tank capacity and household load.
-"""
-
 from __future__ import annotations
 
 import argparse
-import sys
+import calendar
+import os
+import re
+import tempfile
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
+
+
+def _date(value: date, label: str) -> date:
+    if type(value) is not date:
+        raise ValueError(f"{label} must be a date without a time.")
+    return value
+
+
+def _parse_date(raw: str) -> date:
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", raw):
+        raise argparse.ArgumentTypeError("Use a valid date in YYYY-MM-DD format.")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Use a valid date in YYYY-MM-DD format.") from None
+
+
+def _integer(value: int, label: str, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError(f"{label} must be a whole number from 1 to {maximum}.")
+    return value
+
+
+def _text(value: str, label: str, maximum: int, multiline: bool = False) -> str:
+    if not isinstance(value, str) or len(value) > maximum:
+        raise ValueError(f"{label} must be text of at most {maximum} characters.")
+    allowed = "\r\n\t" if multiline else ""
+    if any((ord(char) < 32 and char not in allowed) or ord(char) == 127 for char in value):
+        raise ValueError(f"{label} contains an unsupported control character.")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{label} must contain valid Unicode text encodable as UTF-8.") from None
+    return value
+
+
+def _add_months(anchor: date, months: int) -> date:
+    """Clamp to the target month's last day, always using the original anchor."""
+    year, month_index = divmod(anchor.year * 12 + anchor.month - 1 + months, 12)
+    if not 1 <= year <= 9999:
+        raise ValueError("The selected schedule exceeds the supported calendar date range.")
+    month = month_index + 1
+    return date(year, month, min(anchor.day, calendar.monthrange(year, month)[1]))
+
+
+def _escape_ics(text: str) -> str:
+    return (text.replace("\r\n", "\n").replace("\r", "\n")
+            .replace("\\", "\\\\").replace(";", "\\;")
+            .replace(",", "\\,").replace("\n", "\\n"))
+
+
+def _fold_ics(line: str) -> str:
+    """Fold to at most 75 UTF-8 octets per RFC 5545, including continuation space."""
+    parts = []
+    current = ""
+    octets = 0
+    for character in line:
+        width = len(character.encode("utf-8"))
+        if octets + width > 75:
+            parts.append(current)
+            current = " "
+            octets = 1
+        current += character
+        octets += width
+    parts.append(current)
+    return "\r\n".join(parts)
 
 
 class OutWestSepticMaintenanceScheduler:
-    """
-    Maintenance scheduler for rural North Texas.
-    Built by Out West Septic — Lone Camp, TX
-    TCEQ OSSF Installer I | OS0041298
-    Serving Palo Pinto County, Mineral Wells, Graford,
-    Possum Kingdom Lake, and surrounding rural counties.
-    outwestseptic.com | 940.452.0598
-    """
+    """Build reminders; the caller chooses the applicable maintenance schedule."""
 
-    SERVICE_AREAS = [
-        "Palo Pinto County TX",
-        "Hood County TX",
-        "Erath County TX",
-        "Stephens County TX",
-        "Young County TX",
-        "Jack County TX",
-        "Eastland County TX",
-        "Mineral Wells TX",
-        "Graford TX",
-        "Possum Kingdom Lake TX",
-        "Lone Camp TX",
-    ]
-
-    # Base pump-interval lookup: (tank_gal, household) → years.
-    # Conservative defaults from Texas A&M AgriLife extension guidance.
-    BASE_INTERVAL_TABLE = {
-        (1000, 2): 5.5,
-        (1000, 4): 2.5,
-        (1000, 6): 1.5,
-        (1250, 2): 6.0,
-        (1250, 4): 3.0,
-        (1250, 6): 2.0,
-        (1500, 2): 7.0,
-        (1500, 4): 3.5,
-        (1500, 6): 2.5,
-    }
-    # Default to the closest table row.
-    DEFAULT_INTERVAL_YEARS = 3.0
-
-    # Garbage disposal adds 30-50% to solids load.
-    DISPOSAL_SOLIDS_BUMP = 0.40
-    # Water softener brine discharge increases solids ~15%.
-    SOFTENER_SOLIDS_BUMP = 0.15
-
-    @classmethod
-    def pump_interval_years(
-        cls,
-        tank_gallons: int,
-        household: int,
-        garbage_disposal: bool = False,
-        water_softener: bool = False,
-    ) -> float:
-        if tank_gallons < 750:
-            raise ValueError("Tank size must be at least 750 gallons.")
-        if household < 1:
-            raise ValueError("Household size must be >= 1.")
-
-        # Look up the closest table row.
-        key = cls._closest_table_key(tank_gallons, household)
-        base = cls.BASE_INTERVAL_TABLE.get(key, cls.DEFAULT_INTERVAL_YEARS)
-
-        # Apply bumps by REDUCING the interval.
-        bump = 0.0
-        if garbage_disposal:
-            bump += cls.DISPOSAL_SOLIDS_BUMP
-        if water_softener:
-            bump += cls.SOFTENER_SOLIDS_BUMP
-
-        return round(base / (1.0 + bump), 1)
-
-    @classmethod
-    def _closest_table_key(cls, tank_gallons: int, household: int) -> tuple[int, int]:
-        best_key = next(iter(cls.BASE_INTERVAL_TABLE))
-        best_dist = abs(best_key[0] - tank_gallons) + abs(best_key[1] - household) * 50
-        for key in cls.BASE_INTERVAL_TABLE:
-            dist = abs(key[0] - tank_gallons) + abs(key[1] - household) * 50
-            if dist < best_dist:
-                best_dist = dist
-                best_key = key
-        return best_key
-
-    @classmethod
+    @staticmethod
     def schedule(
-        cls,
-        tank_gallons: int,
-        household: int,
-        last_pumped: date | None = None,
-        garbage_disposal: bool = False,
-        water_softener: bool = False,
-    ) -> "MaintenanceSchedule":
-        years = cls.pump_interval_years(
-            tank_gallons=tank_gallons,
-            household=household,
-            garbage_disposal=garbage_disposal,
-            water_softener=water_softener,
-        )
-        last = last_pumped or date.today()
-        next_due = last + timedelta(days=int(years * 365))
-        return MaintenanceSchedule(
-            tank_gallons=tank_gallons,
-            household=household,
-            garbage_disposal=garbage_disposal,
-            water_softener=water_softener,
-            interval_years=years,
-            last_pumped=last,
-            next_due=next_due,
+        *, schedule_id: str, first_due: date | None = None,
+        last_service: date | None = None, interval_months: int | None = None,
+        occurrences: int = 1, task: str = "Septic service reminder",
+        notes: str = "", as_of: date | None = None,
+    ) -> "OutWestSepticMaintenanceSchedule":
+        if not isinstance(schedule_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", schedule_id):
+            raise ValueError("Schedule ID must be 1 to 100 letters, digits, periods, underscores or hyphens.")
+        task = _text(task, "Task", 200).strip()
+        if not task:
+            raise ValueError("Task must not be empty.")
+        notes = _text(notes, "Notes", 2000, multiline=True)
+        count = _integer(occurrences, "Occurrences", 120)
+        if (first_due is None) == (last_service is None):
+            raise ValueError("Supply exactly one of first_due or last_service.")
+        if interval_months is not None:
+            _integer(interval_months, "Interval months", 1200)
+        if interval_months is None and (last_service is not None or count > 1):
+            raise ValueError("Interval months is required with last_service or multiple occurrences.")
+        anchor = _date(first_due if first_due is not None else last_service, "Anchor date")
+        reference = date.today() if as_of is None else _date(as_of, "As-of date")
+        if last_service is not None and last_service > reference:
+            raise ValueError("Last-service date cannot be after the as-of date; use first_due for a future plan.")
+        start = 0 if first_due is not None else 1
+        dates = tuple(_add_months(anchor, (interval_months or 0) * index)
+                      for index in range(start, start + count))
+        if dates[-1] == date.max:
+            raise ValueError("A reminder must allow the following date for its exclusive calendar end.")
+        return OutWestSepticMaintenanceSchedule(
+            schedule_id, task, notes, anchor,
+            "first_due" if first_due is not None else "last_service",
+            interval_months, dates, reference,
         )
 
 
 @dataclass(frozen=True)
-class MaintenanceSchedule:
-    tank_gallons: int
-    household: int
-    garbage_disposal: bool
-    water_softener: bool
-    interval_years: float
-    last_pumped: date
-    next_due: date
+class OutWestSepticMaintenanceSchedule:
+    schedule_id: str
+    task: str
+    notes: str
+    anchor_date: date
+    anchor_kind: str
+    interval_months: int | None
+    dates: tuple[date, ...]
+    as_of: date
+
+    @property
+    def next_due(self) -> date:
+        return self.dates[0]
 
     def render(self) -> str:
         lines = [
-            "Out West Septic — Septic Tank Maintenance Schedule",
-            "TCEQ OSSF Installer I | OS0041298 | Lone Camp, TX",
-            "",
-            f"Tank size:            {self.tank_gallons} gallons",
-            f"Household:            {self.household} people",
-            f"Garbage disposal:     {'yes' if self.garbage_disposal else 'no'}",
-            f"Water softener:       {'yes' if self.water_softener else 'no'}",
-            f"Recommended interval: {self.interval_years} years",
-            f"Last pumped:          {self.last_pumped.isoformat()}",
-            f"Next pump due:        {self.next_due.isoformat()}",
-            "",
-            "Reminder: Out West Septic does NOT run a pump truck.",
-            "We refer pumping to a local pumper and recommend you put",
-            "the next pump due date on your calendar.",
-            "",
-            "— Out West Septic — outwestseptic.com — 940.452.0598 —",
+            "Out West Septic project - Maintenance reminders",
+            f"Schedule: {self.schedule_id}",
+            f"Task: {self.task}",
+            f"Supplied {self.anchor_kind.replace('_', ' ')}: {self.anchor_date.isoformat()}",
+            f"Chosen interval: {self.interval_months} calendar months" if self.interval_months else "One dated reminder",
+            f"Status as of: {self.as_of.isoformat()}",
         ]
+        for due in self.dates:
+            status = "overdue" if due < self.as_of else "due today" if due == self.as_of else "upcoming"
+            lines.append(f"- {due.isoformat()}: {status}")
+        if self.notes:
+            lines.append(f"Notes: {self.notes}")
+        lines.append("Dates reflect your choices; confirm requirements with your provider and permitting authority.")
         return "\n".join(lines)
 
-    def to_ics(self) -> str:
-        """Build a minimal RFC 5545 VCALENDAR with one VEVENT for the next pump."""
-        try:
-            from icalendar import Calendar, vText
-        except ImportError:
-            return (
-                "# Install icalendar (`pip install icalendar`) to generate .ics files.\n"
-                + self.render()
-            )
-
-        cal = Calendar()
-        cal.add("prodid", "-//Out West Septic//Maintenance Scheduler//EN")
-        cal.add("version", "2.0")
-        cal.add("calscale", "GREGORIAN")
-        cal.add("x-wr-calname", "Out West Septic — Septic Maintenance")
-        cal.add(
-            "x-wr-caldesc",
-            "Septic tank pump reminders for rural North Texas homeowners.",
+    def to_ics(self, *, generated_at: datetime | None = None) -> str:
+        stamp = datetime.now(timezone.utc) if generated_at is None else generated_at
+        if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
+            raise ValueError("Calendar generation time must be a timezone-aware datetime.")
+        stamp = stamp.astimezone(timezone.utc)
+        dtstamp = (f"{stamp.year:04d}{stamp.month:02d}{stamp.day:02d}T"
+                   f"{stamp.hour:02d}{stamp.minute:02d}{stamp.second:02d}Z")
+        lines = [
+            "BEGIN:VCALENDAR", "VERSION:2.0",
+            "PRODID:-//Out West Septic project//Maintenance Scheduler//EN",
+            "CALSCALE:GREGORIAN",
+        ]
+        description = (
+            f"User-chosen reminder. Schedule ID: {self.schedule_id}. "
+            f"Anchor: {self.anchor_date.isoformat()} ({self.anchor_kind}). "
+            f"Interval months: {self.interval_months if self.interval_months else 'one-time'}. "
+            "Confirm the service plan with your provider and permitting authority."
         )
-
-        from icalendar import Event
-
-        event = Event()
-        event.add("summary", "Septic tank pump due")
-        event.add(
-            "description",
-            (
-                f"Out West Septic — tank pump due. Recommended interval: "
-                f"{self.interval_years} years for {self.tank_gallons} gal tank "
-                f"and {self.household} occupants. "
-                f"Out West Septic does not pump — refer to your local pumper. "
-                f"outwestseptic.com — 940.452.0598."
-            ),
-        )
-        event.add("dtstart", self.next_due)
-        event.add("dtend", self.next_due)
-        event.add("transp", "TRANSPARENT")
-        # Yearly recurrence for the lifetime of the system.
-        rrule = event.add("rrule", {})
-        rrule["freq"] = "yearly"
-        rrule["interval"] = max(1, int(round(self.interval_years)))
-        cal.add_component(event)
-        return cal.to_ical().decode("utf-8")
+        if self.notes:
+            description += "\n" + self.notes
+        for due in self.dates:
+            uid = uuid5(NAMESPACE_URL, f"outwestseptic-maintenance:{self.schedule_id}:{due.isoformat()}")
+            lines.extend([
+                "BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{dtstamp}",
+                f"DTSTART;VALUE=DATE:{due.isoformat().replace('-', '')}",
+                f"DTEND;VALUE=DATE:{(due + timedelta(days=1)).isoformat().replace('-', '')}",
+                f"SUMMARY:{_escape_ics(self.task)}",
+                f"DESCRIPTION:{_escape_ics(description)}",
+                "TRANSP:TRANSPARENT", "END:VEVENT",
+            ])
+        lines.append("END:VCALENDAR")
+        return "\r\n".join(_fold_ics(line) for line in lines) + "\r\n"
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="outwestseptic_maintenance_scheduler",
-        description=(
-            "Septic tank pump-interval scheduler with .ics calendar export.\n"
-            "Built by Out West Septic — outwestseptic.com — TCEQ OSSF Installer I OS0041298."
-        ),
-    )
-    parser.add_argument("tank_gallons", type=int, nargs="?", help="Tank size in gallons.")
-    parser.add_argument("household", type=int, nargs="?", help="Number of occupants.")
-    parser.add_argument(
-        "--last-pumped",
-        metavar="YYYY-MM-DD",
-        help="Date of last pump (default: today).",
-    )
-    parser.add_argument("--disposal", action="store_true", help="Garbage disposal in use.")
-    parser.add_argument("--softener", action="store_true", help="Water softener in use.")
-    parser.add_argument(
-        "--ics", metavar="PATH", help="Write a branded .ics calendar file."
-    )
-    return parser
+MaintenanceSchedule = OutWestSepticMaintenanceSchedule
 
 
-def _parse_date(raw: str) -> date | None:
+def _write_export(target: Path, content: str, *, overwrite: bool) -> None:
+    """Encode before opening files; stage replacements beside the destination."""
+    payload = content.encode("utf-8")
+    if not overwrite:
+        with target.open("xb") as output:
+            output.write(payload)
+        return
+    staged = None
     try:
-        return datetime.strptime(raw, "%Y-%m-%d").date()
-    except (TypeError, ValueError):
-        return None
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=target.parent, prefix=".outwestseptic-export-",
+            suffix=".tmp", delete=False,
+        ) as output:
+            staged = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(staged, target)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _build_arg_parser()
-    args = parser.parse_args(argv)
-
-    tank = args.tank_gallons
-    household = args.household
-    if tank is None or household is None:
-        try:
-            tank = tank if tank is not None else int(input("Tank gallons: "))
-            household = household if household is not None else int(input("Household: "))
-        except (EOFError, ValueError):
-            print("Tank gallons and household are required.", file=sys.stderr)
-            return 2
-
-    last_pumped = _parse_date(args.last_pumped) if args.last_pumped else None
-
-    schedule = OutWestSepticMaintenanceScheduler.schedule(
-        tank_gallons=tank,
-        household=household,
-        last_pumped=last_pumped,
-        garbage_disposal=args.disposal,
-        water_softener=args.softener,
+    parser = argparse.ArgumentParser(
+        description="Create dated service reminders from a schedule you choose.",
+        allow_abbrev=False,
     )
+    parser.add_argument("--schedule-id", required=True, help="Stable identifier unique to this system and task.")
+    dates = parser.add_mutually_exclusive_group(required=True)
+    dates.add_argument("--first-due", type=_parse_date, metavar="YYYY-MM-DD")
+    dates.add_argument("--last-service", type=_parse_date, metavar="YYYY-MM-DD")
+    parser.add_argument("--interval-months", type=int, help="Chosen calendar-month interval; no default.")
+    parser.add_argument("--occurrences", type=int, default=1, help="Number of reminders, 1 to 120; default 1.")
+    parser.add_argument("--task", default="Septic service reminder")
+    parser.add_argument("--notes", default="")
+    parser.add_argument("--as-of", type=_parse_date, help="Status reference date; default local today.")
+    parser.add_argument("--ics", type=Path, metavar="PATH", help="Export all-day iCalendar reminders.")
+    parser.add_argument("--overwrite", action="store_true", help="Allow replacing the selected calendar file.")
+    args = parser.parse_args(argv)
+    try:
+        schedule = OutWestSepticMaintenanceScheduler.schedule(
+            schedule_id=args.schedule_id, first_due=args.first_due, last_service=args.last_service,
+            interval_months=args.interval_months, occurrences=args.occurrences,
+            task=args.task, notes=args.notes, as_of=args.as_of,
+        )
+        if args.overwrite and args.ics is None:
+            raise ValueError("--overwrite requires --ics.")
+        if args.ics is not None:
+            content = schedule.to_ics()
+            _write_export(args.ics, content, overwrite=args.overwrite)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
     print(schedule.render())
-
-    if args.ics:
-        with open(args.ics, "w", encoding="utf-8") as fh:
-            fh.write(schedule.to_ics())
-        print(f"\n.ics written to {args.ics}")
+    if args.ics is not None:
+        print(f"Calendar written: {args.ics}")
     return 0
 
 
